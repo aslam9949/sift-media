@@ -1,4 +1,4 @@
-"""Smart filter — b.ai (OpenAI-compatible) DeepSeek calls.
+"""Smart filter — OpenRouter fallback chain with free models.
 
 Slow lane: batched, 2-way  (TRD 5a)
 Fast lane: per-item, 3-way (TRD 5b)
@@ -8,7 +8,8 @@ Fail-soft policy:
                   slightly noisy feed than a dead one)
   * fast lane  -> LLM down means REVIEW (never auto-post an unjudged market
                   item; spec says favour review over guessing)
-"""
+
+OpenRouter fallback chain cycles through free models on 429 / failure."""
 from __future__ import annotations
 
 import json
@@ -18,18 +19,28 @@ import threading
 import time
 from typing import Any
 
+import httpx
+
 import config
 import pipeline  # for clean_text and link helpers used in fallback formatting
 
 log = logging.getLogger("smart_filter")
 
-_client = None
+# OpenRouter free model fallback chain — cycled on HTTP 429 or transient failure.
+FALLBACK_MODELS = [
+    "google/gemma-4-31b-it:free",
+    "nex-agi/nex-n2.5-mini:free",
+    "thinkingmachines/inkling:free",
+    "nvidia/nemotron-3.5-content-safety:free",
+]
+
+_http_client: httpx.AsyncClient | None = None
 _llm_lock = threading.Lock()
 _last_call = 0.0
 
 
 def _pace() -> None:
-    """Serialize + space out LLM calls — b.ai returns 429 under concurrency."""
+    """Serialize + space out LLM calls — OpenRouter rate-limits under concurrency."""
     global _last_call
     with _llm_lock:
         gap = config.LLM_MIN_GAP_SEC - (time.monotonic() - _last_call)
@@ -37,75 +48,123 @@ def _pace() -> None:
             time.sleep(gap)
         _last_call = time.monotonic()
 
-SLOW_PROMPT = """You are a news filtering and deduplication engine for a Telegram news aggregation
-bot. You will be given a numbered batch of candidate news items (title, source
-domain, and target category) collected from RSS feeds and Google News.
 
-Your job is QUALITY over volume. A quiet, high-signal feed beats a flood.
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(config.LLM_TIMEOUT),
+            headers={
+                "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/aslam9949/sift-media",
+                "X-Title": "Sift Media",
+            },
+        )
+    return _http_client
 
-For each item, judge:
-1. RELEVANT - does the title genuinely match its target category, not just
-coincidentally contain a keyword? (e.g. "Gold's Gym opens new branch" is NOT
-gold-market news)
-2. QUALITY - reject pure clickbait, opinion/op-ed pieces, stock-picker blogs,
-listicles, and low-substance roundups (e.g. "5 things to know today", "top 10
-stocks to buy") unless clearly high-value wire news
-3. DUPLICATE - group items reporting the same underlying story/event even if
-worded differently, and pick the single best representative (prefer the
-higher-quality/more recognizable source domain)
-4. MATERIALITY - only keep stories a serious reader would care about today
 
-CATEGORY BOUNDARIES - these three are easy to confuse, be strict:
-- "geopolitics" = relations BETWEEN countries: wars, ceasefires, military
-action, sanctions, treaties, alliances (NATO/UN/BRICS), diplomacy, summits,
-border disputes, trade wars between nations.
-- "us_politics" = US DOMESTIC politics: Congress, elections, party fights,
-Supreme Court, US budget/legislation.
-- "india_politics" = India DOMESTIC politics: Parliament, state elections,
-party politics, domestic policy.
-A story about one country striking, sanctioning, or negotiating with ANOTHER
-country is geopolitics, even when a domestic leader is the subject. A story
-about a leader's standing at home is domestic politics.
+async def _call_openrouter_fallback(messages: list[dict[str, str]]) -> str:
+    """POST to OpenRouter, cycling through free fallback models on 429.
 
-Respond with ONLY a JSON array, no prose, no markdown fences. One object per
-input item id:
+    Returns the raw content string on success.  Raises RuntimeError if every
+    model in the chain fails.
+    """
+    client = _get_http_client()
+    last_err: Exception | None = None
 
+    for model in FALLBACK_MODELS:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": config.LLM_MAX_TOKENS,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            _pace()
+            resp = await client.post(
+                f"{config.OPENROUTER_API_BASE}/chat/completions",
+                json=payload,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                choice = data["choices"][0]
+                content = (choice["message"].get("content") or "").strip()
+                if content:
+                    log.info("OpenRouter model %s returned %d chars", model, len(content))
+                    return content
+                log.warning("OpenRouter %s returned empty content", model)
+            elif resp.status_code == 429:
+                log.warning("OpenRouter %s rate-limited (429) — trying next model", model)
+                await _async_sleep(config.LLM_RATE_BACKOFF_SEC)
+            else:
+                body = resp.text[:200]
+                log.warning("OpenRouter %s returned %d: %s", model, resp.status_code, body)
+        except Exception as exc:
+            last_err = exc
+            log.warning("OpenRouter %s call failed: %s", model, str(exc)[:160])
+
+        # Brief pause before next model
+        await _async_sleep(1.5)
+
+    raise RuntimeError(f"All OpenRouter fallback models exhausted. Last error: {last_err}")
+
+
+async def _async_sleep(seconds: float) -> None:
+    """Non-blocking sleep for async contexts."""
+    import asyncio
+    await asyncio.sleep(seconds)
+
+
+# ------------------------------------------------------------------- prompts
+CHIEF_EDITOR_SYSTEM = """You are the Chief Editor for Sift Media, a high-frequency, institutional-grade financial and geopolitical news wire. Your objective is to filter noise, rank significance with ruthless objectivity, and write concise, mechanism-focused summaries. You are the final gatekeeper before news reaches thousands of traders and analysts.
+
+### INPUT FORMAT
+You will receive a JSON array of news items. Each item contains an 'id', 'title', 'snippet', 'source', and 'source_rank'.
+
+### SIGNIFICANCE SCORING RULES (1-10 Scale)
+You must be ruthlessly strict. Do not inflate scores. The market only cares about capital flows, policy shifts, and systemic risks.
+- [1-3] NOISE: Routine market updates, minor corporate announcements, opinion pieces, clickbait, local non-impactful news, celebrity gossip, sports. -> DECISION: "reject"
+- [4-5] ROUTINE: Standard earnings that meet expectations, minor policy tweaks, standard geopolitical rhetoric without action, routine economic prints that match forecasts. -> DECISION: "reject"
+- [6-7] NOTABLE: Surprises in earnings (beats/misses), central bank hints or speeches, major corporate mergers/acquisitions, significant geopolitical tensions escalating, unexpected economic data prints. -> DECISION: "keep"
+- [8-9] MAJOR: Actual central bank rate decisions, massive market crashes/surges (>3% index moves), confirmed geopolitical conflicts/sanctions, major IPO pricings, critical legislative bills passing. -> DECISION: "keep"
+- [10] WORLD-MOVING: Black swan events, unexpected wars, emergency central bank meetings, systemic financial collapses, pandemics, sovereign debt defaults. -> DECISION: "keep"
+
+### STRICT MODE (Fast Lane / Corporate Actions)
+If the item 'category' implies a corporate action (e.g., 'director_change', 'analyst_meet', 'record_date', 'corp_action'), apply STRICT MODE:
+- Routine board shuffles or standard record dates are a [4] -> "reject".
+- CEO resignations due to scandal, sudden guidance downgrades, or hostile takeover bids are an [8+] -> "keep".
+
+### WRITING & FORMATTING RULES
+- summary_ai: 1-2 sentences. Pure facts. Who, what, when. No fluff, no adjectives.
+- why_matters: Explain the ECONOMIC or GEOPOLITICAL MECHANISM. (e.g., "Rises in CPI reduce the probability of Fed rate cuts, strengthening the USD and pressuring Gold.") NEVER give financial advice. NEVER use words like "buy", "sell", "bullish", or "bearish".
+- watch_next: One concrete future event, data print, or timestamp related to this story. (e.g., "Next FOMC meeting on Nov 12" or "Q3 earnings call on Oct 24").
+
+### ANTI-HALLUCINATION & EDGE CASES
+- If the snippet is too short to determine significance, default to "reject" (score 4).
+- NEVER invent numbers. If the text says "revenue grew" but gives no percentage, do not guess the percentage.
+- If a source_rank is 8+, give it the benefit of the doubt on borderline [5] vs [6] stories.
+
+### OUTPUT JSON SCHEMA
+Return ONLY a valid JSON array. No markdown formatting, no explanations.
+Schema:
 [
-  {"id": 3, "keep": true, "category": "gold_news", "duplicate_of": null, "importance": 3,
-   "summary_ai": "Gold pushed to a fresh record as traders priced in a September rate cut.",
-   "why_matters": "A weaker dollar and steady central-bank buying keep the uptrend intact.",
-   "watch_next": "This week's US inflation print - a hot number could stall the rally.",
-   "significance": 7,
-   "explain": "Gold pushed to a fresh record as traders priced in a September rate cut.\\nA weaker dollar makes bullion cheaper for overseas buyers, so demand rose.\\nCentral banks have also kept buying through the year, tightening supply.\\nFor Indian buyers the move is amplified by a soft rupee.\\nWatch this week's US inflation print - a hot number would stall the rally."},
-  {"id": 4, "keep": false, "reason": "off-topic"},
-  {"id": 5, "keep": true, "category": "gold_news", "duplicate_of": 3, "importance": 2}
+  {
+    "id": "original_id_string",
+    "decision": "keep" | "reject",
+    "significance": <integer 1-10>,
+    "summary_ai": "<string>",
+    "why_matters": "<string>",
+    "watch_next": "<string>"
+  }
 ]
+If an item is rejected, you ONLY need to provide "id", "decision": "reject", and "significance". Save tokens and processing time."""
 
-Rules:
-- KEEP only if relevant AND not clickbait AND significance >= 5. If unsure, keep=false.
-- "summary_ai": 1-3 plain-sentence recap of what happened, in your own words
-  (never copied from the article). "why_matters": 1-2 sentences on why a reader
-  should care. "watch_next": 1 concrete, forward-looking sentence on the next
-  development to watch, or "" if none. These three are PREFERRED over "explain".
-- "explain" is the OLD fallback field - still include it (4-8 short lines), used
-  only if summary_ai is empty.
-- "significance" is YOUR editorial score of how material the story is: 7-10
-  major (wars, big policy, market-moving), 4-6 moderate, 1-3 minor. Score the
-  event, not the headline hype. Do not inflate to force a keep.
-- "duplicate_of" is the id of the item you consider the canonical version of the
-  same story; null if unique.
-- "importance" is 1 (routine) to 5 (major/market-moving) - be conservative.
-- Never invent ids not present in the input.
-- Prefer wire/major newsrooms (Reuters, BBC, TOI, NDTV, ET, Livemint) over
-  unknown Google News syndicates when picking a duplicate winner.
 
-EXPLAIN / SUMMARY FIELD RULES - whenever keep is true:
-- Base it ONLY on the title, snippet and source given to you. Do NOT invent
-numbers, quotes, dates, or names that are not in the input. If the input is
-thin, write fewer lines rather than inventing detail.
-- Never copy the article's sentences verbatim - summarise in your own words.
-- No markdown, no bullet characters, no headings. Just plain lines.
-- Do not repeat the headline as the first line - add information instead."""
+# Legacy prompt kept for backward compatibility if needed — but the chief-editor
+# prompt above is the one wired into the main flow.
+SLOW_PROMPT = CHIEF_EDITOR_SYSTEM
 
 FAST_PROMPT = """You are a market-alert filtering engine for a Telegram bot focused on India
 and US market-moving events (bulk/block deals, earnings, IPO, corporate
@@ -117,14 +176,22 @@ Decide one of three outcomes:
 immediately. Examples: dividend/bonus/buyback, order win, earnings with
 numbers, bulk/block deal, IPO, material 8-K.
 2. REJECT - clearly irrelevant, spam, or routine filing - drop silently.
-Examples: newspaper publication reprints, director changes, empty analyst-meet
-updates, shareholders meeting with no special resolution, compliance certificates.
+Examples: newspaper publication reprints, empty compliance certificates,
+routine shareholders meetings with no special resolution.
 3. REVIEW - relevant but ambiguous (unclear significance, possible duplicate,
 unclear company match, or borderline importance) - send to a private admin
-review queue instead of guessing
+review queue instead of guessing.
+
+IMPORTANT — STRICT MODE for corporate actions:
+If the event_type is director_change, analyst_meet, or record_date, evaluate
+carefully:
+- Routine board shuffles / standard record dates → score 4, decision "reject".
+- CEO resignations due to scandal, hostile takeover bids, sudden guidance
+downgrades → score 8+, decision "keep".
 
 Respond with ONLY a JSON object, no prose, no markdown fences:
-{"decision": "keep", "category": "...", "importance": 1-5, "significance": 1-10, "reason": "short one-line reason, always included",
+{"decision": "keep"|"reject"|"review", "category": "...", "importance": 1-5,
+ "significance": 1-10, "reason": "short one-line reason, always included",
  "summary_ai": "1-3 plain-sentence recap in your own words (never copied from the filing)",
  "why_matters": "1-2 sentences on why a trader should care, in your own words",
  "watch_next": "1 concrete forward-looking sentence on what to watch, or empty string",
@@ -139,6 +206,9 @@ wrong high-confidence post.
 - "importance" 1 (routine filing) to 5 (major market-moving event). "significance"
 is your 1-10 editorial score of materiality: 7-10 major, 4-6 moderate, 1-3 minor.
 - summary_ai / why_matters / watch_next are PREFERRED over "explain" when present.
+- For STRICT_MODE items (director_change, analyst_meet, record_date): default to
+reject unless the event is genuinely material. These are the most common spam
+categories on NSE/BSE — be ruthlessly honest about whether the market cares.
 - Never invent data not present in the input.
 
 EXPLAIN FIELD - required when decision is "keep" (omit for reject/review):
@@ -156,20 +226,7 @@ fewer lines, never invented detail.
 - Do not repeat the headline as the first line - add information instead."""
 
 
-def _get_client():
-    global _client
-    if _client is None:
-        from openai import OpenAI
-
-        _client = OpenAI(
-            api_key=config.LLM_API_KEY,
-            base_url=config.LLM_BASE_URL,
-            timeout=config.LLM_TIMEOUT,
-            max_retries=2,
-        )
-    return _client
-
-
+# -------------------------------------------------------------- sync helpers
 def _extract_json(text: str) -> Any:
     """Models sometimes wrap output in fences or prose — dig the JSON out."""
     text = (text or "").strip()
@@ -178,15 +235,12 @@ def _extract_json(text: str) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # If the model was asked for an array, don't let the object-fallback below
-    # return just the first element — try array repair first.
     stripped = text.lstrip()
     if stripped.startswith("["):
         repaired = _repair_truncated_json(text)
         if isinstance(repaired, list):
             log.warning("recovered truncated JSON array from model output")
             return repaired
-
     for opener, closer in (("[", "]"), ("{", "}")):
         start, end = text.find(opener), text.rfind(closer)
         if start != -1 and end > start:
@@ -194,14 +248,10 @@ def _extract_json(text: str) -> Any:
                 return json.loads(text[start : end + 1])
             except json.JSONDecodeError:
                 continue
-
-    # Truncated output (hit the token cap mid-object). Repair rather than
-    # discard: close any open string, then close open braces/brackets.
     repaired = _repair_truncated_json(text)
     if repaired is not None:
         log.warning("recovered truncated JSON from model output")
         return repaired
-
     raise ValueError(f"no JSON in model output: {text[:200]}")
 
 
@@ -214,8 +264,6 @@ def _repair_truncated_json(text: str) -> Any | None:
     if start == -1:
         return None
     frag = text[start:]
-
-    # Track structure while respecting strings and escapes.
     stack: list[str] = []
     in_str = False
     escaped = False
@@ -235,23 +283,17 @@ def _repair_truncated_json(text: str) -> Any | None:
         elif ch in "]}":
             if stack:
                 stack.pop()
-
     candidate = frag
     if in_str:
         candidate += '"'
-    # Drop a dangling ", key": or trailing comma before closing.
     candidate = re.sub(r",\s*\"[^\"]*\"\s*:\s*$", "", candidate)
     candidate = re.sub(r",\s*$", "", candidate)
     for opener in reversed(stack):
         candidate += "]" if opener == "[" else "}"
-
     try:
         parsed = json.loads(candidate)
     except json.JSONDecodeError:
         parsed = None
-
-    # If the source fragment was an array, the result must stay an array — a
-    # brace-balanced repair can otherwise yield just the first object.
     if frag.lstrip().startswith("["):
         if isinstance(parsed, list):
             return parsed
@@ -262,69 +304,41 @@ def _repair_truncated_json(text: str) -> Any | None:
             except json.JSONDecodeError:
                 return None
         return [parsed] if isinstance(parsed, dict) else None
-
     return parsed
 
 
-def _chat(system: str, user: str, attempts: int = 3) -> str:
-    """Call the model, retrying when it returns empty content.
-
-    This is a reasoning model: it spends tokens on an internal
-    `reasoning_content` channel before emitting the real answer. Occasionally a
-    response comes back with reasoning but an EMPTY content field. That's
-    transient, so retry rather than treating it as a hard failure.
-    """
+async def _chat_async(system: str, user: str, attempts: int = 2) -> str:
+    """Call OpenRouter with fallback chain. Async."""
     last_err: Exception | None = None
     for i in range(attempts):
         try:
-            _pace()
-            resp = _get_client().chat.completions.create(
-                model=config.LLM_MODEL,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                temperature=0,
-                max_tokens=config.LLM_MAX_TOKENS,
-            )
-            choice = resp.choices[0]
-            content = (choice.message.content or "").strip()
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+            content = await _call_openrouter_fallback(messages)
             if content:
                 return content
-            last_err = RuntimeError(
-                f"empty content (finish={choice.finish_reason}, "
-                f"completion_tokens={getattr(resp.usage, 'completion_tokens', '?')})"
-            )
-            log.warning("empty model content on try %d/%d — retrying", i + 1, attempts)
+            last_err = RuntimeError("empty content from all models")
         except Exception as exc:
             last_err = exc
-            is_429 = "429" in str(exc) or "rate" in str(exc).lower()
-            log.warning("LLM call failed on try %d/%d: %s", i + 1, attempts, str(exc)[:160])
-            if is_429 and i < attempts - 1:
-                # Rate limited — back off hard before retrying.
-                time.sleep(config.LLM_RATE_BACKOFF_SEC * (2 ** i))
-                continue
-        if i < attempts - 1:
-            time.sleep(1.5 * (i + 1))
+            log.warning("LLM async call failed on try %d/%d: %s", i + 1, attempts, str(exc)[:160])
+            await _async_sleep(2.0 * (i + 1))
     raise RuntimeError(f"LLM produced no usable output after {attempts} tries: {last_err}")
 
 
 # --------------------------------------------------------------- slow lane
 def clean_explain(raw: Any, min_lines: int = 2, max_lines: int = 8) -> str:
-    """Normalise the model's explainer into 2-8 clean plain-text lines.
-
-    Strips markdown/bullet noise, drops empties, caps line and total length.
-    Returns "" if there's nothing usable, and callers must treat "" as
-    "post without an explainer" rather than failing.
-    """
     if not isinstance(raw, str):
         return ""
     text = raw.replace("\\n", "\n")
     out: list[str] = []
     for line in text.split("\n"):
         line = line.strip()
-        # strip leading bullets / numbering / markdown headings
         line = re.sub(r"^\s*(?:[-*•·>]+|\d+[.)])\s*", "", line)
         line = re.sub(r"^#{1,6}\s*", "", line)
-        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)   # **bold**
-        line = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", line)  # *italic*
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+        line = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", line)
         line = line.strip()
         if not line:
             continue
@@ -338,7 +352,7 @@ def clean_explain(raw: Any, min_lines: int = 2, max_lines: int = 8) -> str:
     return "\n".join(out)
 
 
-def filter_batch(items: list[dict[str, Any]], _retry_explain: bool = True) -> list[dict[str, Any]]:
+async def filter_batch(items: list[dict[str, Any]], _retry_explain: bool = True) -> list[dict[str, Any]]:
     """Batched 2-way filter. Returns the items that survive, with category set."""
     if not items:
         return []
@@ -348,24 +362,22 @@ def filter_batch(items: list[dict[str, Any]], _retry_explain: bool = True) -> li
 
     lines = []
     for idx, it in enumerate(items, start=1):
-        # Include the snippet — the model needs real context to write a useful
-        # explainer, and it also sharpens the relevance judgement.
         snip = (it.get("snippet") or it.get("summary") or "").strip().replace("\n", " ")
         if len(snip) > 400:
             snip = snip[:400] + "…"
+        rank = it.get("source_rank", pipeline.source_reliability(it.get("source"), it.get("url")))
         lines.append(
-            f'{idx}. title: "{it.get("title","")}" | source: {it.get("source","")} '
-            f'| target_category: {it.get("category","general")}'
+            f'{idx}. id:"{it.get("url","")}" | title: "{it.get("title","")}" | source: {it.get("source","")} '
+            f'| source_rank: {rank} | target_category: {it.get("category","general")}'
             + (f'\n   snippet: "{snip}"' if snip else "")
         )
     payload = "Candidate items:\n" + "\n".join(lines)
 
     try:
-        verdicts = _extract_json(_chat(SLOW_PROMPT, payload))
+        verdicts = _extract_json(await _chat_async(SLOW_PROMPT, payload))
         if not isinstance(verdicts, list):
             raise ValueError("expected a JSON array")
     except Exception as exc:
-        # Fail-soft: only pass wire/major newsrooms (rel >= 8). Never dump junk.
         wire = [
             it for it in items
             if pipeline.source_reliability(it.get("source"), it.get("url")) >= 8
@@ -376,30 +388,41 @@ def filter_batch(items: list[dict[str, Any]], _retry_explain: bool = True) -> li
         )
         return wire
 
-    by_id = {i: it for i, it in enumerate(items, start=1)}
+    by_url = {it.get("url"): it for it in items}
     kept: list[dict[str, Any]] = []
-    canonical_seen: set[int] = set()
 
     for v in verdicts:
         if not isinstance(v, dict):
             continue
-        try:
-            vid = int(v.get("id"))
-        except (TypeError, ValueError):
-            continue
-        item = by_id.get(vid)
-        if item is None or not v.get("keep"):
-            continue
-        dup_of = v.get("duplicate_of")
-        if dup_of is not None:
+        vid = v.get("id", "")
+        item = by_url.get(vid)
+        if item is None:
+            # Try matching by index
             try:
-                if int(dup_of) != vid:
-                    continue  # a non-canonical duplicate — drop
+                idx = int(vid)
+                if 1 <= idx <= len(items):
+                    item = items[idx - 1]
             except (TypeError, ValueError):
                 pass
-        if vid in canonical_seen:
+        if item is None:
             continue
-        canonical_seen.add(vid)
+
+        decision = str(v.get("decision", "reject")).lower().strip()
+        if decision not in ("keep", "reject"):
+            continue
+
+        # --- Hard Python override: enforce significance floor ---
+        try:
+            sig = max(1, min(10, int(v.get("significance") or 5)))
+        except (TypeError, ValueError):
+            sig = 5
+        if decision == "keep" and sig < config.POST_MIN_SIGNIFICANCE:
+            decision = "reject"
+            log.info("Python override: significance %d < %d → reject %s", sig, config.POST_MIN_SIGNIFICANCE, item.get("title", "")[:60])
+
+        if decision != "keep":
+            continue
+
         cat = v.get("category")
         if isinstance(cat, str) and cat in config.CHANNEL_MAP:
             item["category"] = cat
@@ -408,62 +431,16 @@ def filter_batch(items: list[dict[str, Any]], _retry_explain: bool = True) -> li
         item["summary_ai"] = pipeline.clean_text(v.get("summary_ai") or "")
         item["why_matters"] = pipeline.clean_text(v.get("why_matters") or "")
         item["watch_next"] = pipeline.clean_text(v.get("watch_next") or "")
-        try:
-            item["significance"] = max(1, min(10, int(v.get("significance") or 5)))
-        except (TypeError, ValueError):
-            item["significance"] = 5
-        if item["significance"] < config.POST_MIN_SIGNIFICANCE:
-            continue
+        item["significance"] = sig
         kept.append(item)
 
     n_expl = sum(1 for i in kept if i.get("explain"))
-    n_card = sum(1 for i in kept if i.get("summary_ai") or i.get("explain"))
-
-    # The model sometimes omits the "explain"/"summary_ai" fields. Retry once
-    # with a reminder — but only when the CARD BODY is missing (summary_ai or
-    # explain). If summary_ai is already there we don't need the fallback, so
-    # no point spending another call.
-    if kept and n_card == 0 and _retry_explain:
-        log.warning("batch returned no explainers — retrying once with a reminder")
-        try:
-            reminder = payload + (
-                "\n\nIMPORTANT: your previous response omitted the required "
-                '"explain" field. Return the same JSON array again and include a '
-                '4-8 line "explain" string for EVERY item where keep is true.'
-            )
-            again = _extract_json(_chat(SLOW_PROMPT, reminder))
-            if isinstance(again, list):
-                by_url = {i.get("url"): i for i in kept}
-                idx_to_item = {i: it for i, it in enumerate(items, start=1)}
-                filled = 0
-                for v in again:
-                    if not isinstance(v, dict):
-                        continue
-                    try:
-                        vid = int(v.get("id"))
-                    except (TypeError, ValueError):
-                        continue
-                    src = idx_to_item.get(vid)
-                    if src is None:
-                        continue
-                    target = by_url.get(src.get("url"))
-                    if target is None or target.get("explain"):
-                        continue
-                    ex = clean_explain(v.get("explain"))
-                    if ex:
-                        target["explain"] = ex
-                        filled += 1
-                n_expl = sum(1 for i in kept if i.get("explain"))
-                log.info("explainer retry filled %d item(s)", filled)
-        except Exception as exc:
-            log.warning("explainer retry failed (%s) — posting without explainers", exc)
-
     log.info("slow-lane filter: %d in -> %d kept (%d with explainer)", len(items), len(kept), n_expl)
     return kept
 
 
 # --------------------------------------------------------------- fast lane
-def filter_item(item: dict[str, Any]) -> dict[str, Any]:
+async def filter_item(item: dict[str, Any]) -> dict[str, Any]:
     """Per-item 3-way filter. Returns a verdict dict with the card fields."""
     fallback = {
         "decision": "review",
@@ -484,24 +461,43 @@ def filter_item(item: dict[str, Any]) -> dict[str, Any]:
     snip = (item.get("snippet") or item.get("summary") or "").strip().replace("\n", " ")
     if snip:
         payload += f'\nsnippet: "{snip[:400]}"'
+
+    # Flag STRICT_MODE for previously-blind-rejected categories
+    et = (item.get("event_type") or "").lower()
+    if et in ("director_change", "analyst_meet", "record_date"):
+        payload += "\n\nSTRICT_MODE: This is a corporate action type that is often noise. " \
+                   "Default to REJECT unless the event is genuinely market-moving " \
+                   "(CEO scandal, hostile takeover, sudden guidance downgrade → KEEP with score 8+)."
+
     try:
-        v = _extract_json(_chat(FAST_PROMPT, payload))
+        user_msg = payload
+        messages = [
+            {"role": "system", "content": FAST_PROMPT},
+            {"role": "user", "content": user_msg},
+        ]
+        raw = await _call_openrouter_fallback(messages)
+        v = _extract_json(raw)
         if not isinstance(v, dict):
             raise ValueError("expected a JSON object")
+
         decision = str(v.get("decision", "review")).lower().strip()
         if decision not in {"keep", "reject", "review"}:
             decision = "review"
-        cat = v.get("category")
+
         try:
             sig = max(1, min(10, int(v.get("significance") or 5)))
         except (TypeError, ValueError):
             sig = 5
+
+        # --- Hard Python override: enforce significance floor ---
         if decision == "keep" and sig < config.POST_MIN_SIGNIFICANCE:
             decision = "reject"
             v["reason"] = (
                 str(v.get("reason") or "")
                 + f" | below significance floor {config.POST_MIN_SIGNIFICANCE}"
             ).strip(" |")
+
+        cat = v.get("category")
         return {
             "decision": decision,
             "category": cat if isinstance(cat, str) and cat in config.CHANNEL_MAP else item.get("category", "general"),

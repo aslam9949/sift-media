@@ -1,6 +1,6 @@
 """Bot #1 — Slow Lane (general news).
 
-scheduler → fetcher → normalizer → rule prefilter (URL dedup + rapidfuzz)
+scheduler → fetcher → normalizer → Dual-Track Smart Capping
 → BATCHED smart filter → router → send queue → Telegram
 """
 from __future__ import annotations
@@ -32,23 +32,20 @@ async def run_cycle() -> dict[str, int]:
     normalized = [n for n in (pipeline.normalize(r) for r in raw) if n]
     stats["normalized"] = len(normalized)
 
-    candidates = pipeline.prefilter(normalized)
+    # Dual-Track Smart Capping replaces the old blind Top-40 sort.
+    # VIP lane (rank 8+) gets 50 slots, standard gets 100.
+    candidates = pipeline.prefilter_and_cap(normalized, max_total=150)
     stats["prefiltered"] = len(candidates)
-
-    # Newest first, then cap the cycle so one burst can't flood the channels.
-    candidates.sort(key=lambda i: i.get("published_at") or "", reverse=True)
-    candidates = candidates[: config.MAX_ITEMS_PER_CYCLE]
 
     kept: list[dict[str, Any]] = []
     for batch in _batches(candidates, config.SLOW_BATCH_SIZE):
-        kept.extend(smart_filter.filter_batch(batch))
+        kept.extend(await smart_filter.filter_batch(batch))
     stats["kept"] = len(kept)
 
     queue = get_queue(config.BOT1_TOKEN, "slow")
     queue.start()
 
     for item in kept:
-        # Claim the URL BEFORE sending so a crash mid-cycle can't double-post.
         if not db.mark_seen(item, lane="slow", posted=False):
             continue
         cat = item.get("category") or "general"

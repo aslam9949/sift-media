@@ -10,6 +10,7 @@ NO extra LLM calls.
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 from collections import OrderedDict
@@ -233,7 +234,10 @@ async def run(window_hours: int, label: str) -> int:
         log.info("digest %s: only %d items (< %d) — skipping PDF", label, len(items), config.DIGEST_MIN_ITEMS)
         return 0
 
-    pdf_bytes = build_pdf(items, label, (w_start, w_end))
+    # build_pdf is CPU-bound (ReportLab). Offload it to the executor so it never
+    # blocks the live scheduler loop — never asyncio.run() here.
+    loop = asyncio.get_running_loop()
+    pdf_bytes = await loop.run_in_executor(None, build_pdf, items, label, (w_start, w_end))
     fname = f"aslam_news_{label.lower().replace(' ', '_')}_{now.strftime('%Y%m%d_%H%M')}.pdf"
 
     from aiogram import Bot

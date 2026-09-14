@@ -1,9 +1,14 @@
 """Normalizer + rule-based prefilter + router/formatter.
 
+Dual-Track Smart Factory: VIP lane (Rank 8+) bypasses aggressive dedup;
+Standard lane goes through MinHash dedup and clickbait filtering.
+Google News URLs are unwrapped via RSS <source> tag when available.
+
 Constraint 4 lives here: title + short snippet + link ONLY. Never full text.
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import logging
 import re
@@ -11,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlparse, urlunparse
 
-from rapidfuzz import fuzz
+from datasketch import MinHash, MinHashLSH
 
 import config
 import db
@@ -25,9 +30,6 @@ _TRACKING = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_conten
 CATEGORY_KEYWORDS = {
     "crypto_news": ["bitcoin", "btc", "ethereum", "eth", "crypto", "blockchain", "altcoin", "stablecoin", "binance", "solana", "xrp", "defi", "token"],
     "gold_news": ["gold", "bullion", "xau", "precious metal", "silver", "comex gold", "gold price"],
-    # Geopolitics: wars, diplomacy, sanctions, alliances, cross-border conflict.
-    # Kept distinct from us_politics/india_politics (those are DOMESTIC politics)
-    # by scoring on international-relations language rather than party/leader names.
     "geopolitics": [
         "war", "ceasefire", "invasion", "airstrike", "military strike", "missile", "drone strike",
         "troops", "offensive", "border clash", "conflict", "escalation", "truce", "peace talks",
@@ -50,15 +52,39 @@ CATEGORY_KEYWORDS = {
     "us_market_ipo": ["ipo", "s-1", "listing", "public offering", "nasdaq debut"],
 }
 
-# Strong geopolitics signals — a single hit outweighs generic domestic-politics
-# keyword noise (e.g. "Trump announces strikes on Iran" is geopolitics, not
-# us_politics, even though "trump" matches the us_politics list).
 GEO_STRONG = [
     "airstrike", "air strike", "missile strike", "drone strike", "ceasefire", "invasion",
     "war", "troops deployed", "sanctions", "nato", "un security council", "peace talks",
     "border clash", "military operation", "taiwan strait", "south china sea",
     "strait of hormuz", "red sea", "nuclear talks", "arms deal", "treaty",
 ]
+
+# ------------------------------------------------------------- MinHash LSH
+# Global LSH index for O(1) near-duplicate detection.
+# threshold=0.85 means two items with Jaccard ≥ 0.85 are treated as dupes.
+_LSH = MinHashLSH(threshold=0.85, num_perm=128)
+
+
+def _make_minhash(text: str) -> MinHash:
+    """Produce a MinHash signature from a tokenised title."""
+    m = MinHash(num_perm=128)
+    for tok in re.findall(r"[a-z0-9]+", text.lower()):
+        m.update(tok.encode())
+    return m
+
+
+def is_duplicate_fast(title: str, event_id: str) -> bool:
+    """Check + insert into the global LSH index in O(1) amortized.
+
+    Returns True if a near-duplicate (Jaccard ≥ 0.85) is already present.
+    """
+    mh = _make_minhash(title)
+    dupes = _LSH.query(mh)
+    if dupes:
+        log.debug("MinHash duplicate: %s matches %s", event_id[:30], dupes[0][:30])
+        return True
+    _LSH.insert(event_id, mh)
+    return False
 
 
 # ------------------------------------------------------------- normalizing
@@ -129,6 +155,64 @@ def normalize(raw: dict[str, Any], default_category: str = "general") -> dict[st
     }
 
 
+# --------------------------------------------------------- Google News unwrap
+# When the RSS <source> tag carries the real publisher (e.g. "Reuters") but the
+# URL host is news.google.com, we can fix the source rank without an HTTP redirect.
+
+_TLD_STRIP = re.compile(r"\.(com|net|org|io|co\.uk|com\.au|co\.in|in)\b", re.I)
+
+
+def extract_real_publisher(entry: dict[str, Any]) -> tuple[str, str]:
+    """Read RSS <source> tag to find the real publisher domain.
+
+    Returns (publisher_name, domain).  Falls back to parsing the URL host if
+    the source tag is missing or empty.
+    """
+    raw_source = entry.get("rss_source") or {}
+    publisher = ""
+    if isinstance(raw_source, dict):
+        publisher = raw_source.get("title", "").strip()
+    if not publisher and isinstance(raw_source, str):
+        publisher = raw_source.strip()
+
+    # Derive a clean domain from the publisher name
+    domain = ""
+    if publisher:
+        domain = publisher.lower()
+        domain = re.sub(r"[^a-z0-9.]+", ".", domain)
+        domain = re.sub(r"\.{2,}", ".", domain)
+        domain = domain.strip(".")
+        # Strip TLDs: "bloomberg.com" → "bloomberg"
+        domain = _TLD_STRIP.sub("", domain)
+
+    if not domain and entry.get("url"):
+        domain = source_domain(entry["url"])
+
+    return publisher, domain
+
+
+def get_real_rank(real_domain: str) -> int:
+    """Map an unwrapped domain to a hardcoded reliability rank.
+
+    Elite / VIP   8–10
+    Standard      5–7
+    Blocked       0
+    Unknown       5 (default)
+    """
+    if not real_domain:
+        return 5
+    d = real_domain.lower().strip()
+    # Domain-level matches
+    for dom, score in DOMAIN_RELIABILITY.items():
+        if d == dom or d.endswith("." + dom):
+            return score
+    # Brand-name matches via SOURCE_RELIABILITY keys
+    for name, score in SOURCE_RELIABILITY.items():
+        if name.lower() == d or name.lower().replace(" ", "") == d:
+            return score
+    return DEFAULT_RELIABILITY
+
+
 # -------------------------------------------------------------- prefilter
 def guess_category(item: dict[str, Any]) -> str:
     """Keyword scope check — only used when the fetcher didn't pin a category."""
@@ -136,13 +220,8 @@ def guess_category(item: dict[str, Any]) -> str:
     if cat and cat != "general":
         return cat
     blob = f"{item.get('title','')} {item.get('snippet','')}".lower()
-
-    # A strong geopolitics signal wins outright. Otherwise "Trump orders strikes
-    # on Iran" scores 1 for us_politics ("trump") and would beat geopolitics on
-    # a plain tie-break, sending war news to the domestic-politics channel.
     if any(w in blob for w in GEO_STRONG):
         return "geopolitics"
-
     best, score = "daily_news", 0
     for candidate, words in CATEGORY_KEYWORDS.items():
         hits = sum(1 for w in words if w in blob)
@@ -151,12 +230,23 @@ def guess_category(item: dict[str, Any]) -> str:
     return best if score else "daily_news"
 
 
-def prefilter(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Exact-URL dedup (DB + in-batch) then rapidfuzz near-duplicate removal."""
-    out: list[dict[str, Any]] = []
+def prefilter_and_cap(items: list[dict[str, Any]], max_total: int = 150) -> list[dict[str, Any]]:
+    """Dual-Track Smart Capping — replaces the old blind Top-40 sort.
+
+    Split items into VIP lane (Rank ≥ 8) and Standard lane (Rank < 8).
+      • VIPs bypass clickbait checks and fuzzy dedup.  Only exact-URL-hash
+        duplicates (within the same batch, and vs DB) are dropped.
+      • Standards go through strict clickbait regex and MinHash dedup.
+      • Authority dedup: when two items are near-dupes, keep the higher-rank one.
+      • VIP slots (max 50) filled first, newest-first.
+        Remaining capacity (max 100) filled with Standard, sorted by rank desc
+        then newest-first.
+
+    Returns the final capped list, with each item's source rank attached.
+    """
     batch_hashes: set[str] = set()
-    known = db.recent_titles()
-    known_titles = [t for t, _ in known]
+    vip_items: list[dict[str, Any]] = []
+    std_items: list[dict[str, Any]] = []
 
     for item in items:
         h = db.url_hash(item["url"])
@@ -166,31 +256,82 @@ def prefilter(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         batch_hashes.add(h)
 
-        tn = item["title_norm"]
-        if tn:
-            dupe = False
-            for other in known_titles + [i["title_norm"] for i in out]:
-                if other and fuzz.token_set_ratio(tn, other) >= config.FUZZY_THRESHOLD:
-                    dupe = True
-                    break
-            if dupe:
-                log.debug("near-duplicate dropped: %s", item["title"][:70])
-                continue
+        # Determine source rank
+        pub, real_dom = extract_real_publisher(item)
+        rank = source_reliability(item.get("source"), item.get("url"))
+        item["source_rank"] = rank
 
-        if is_blocked_source(item.get("source"), item.get("url")):
+        # Blocked sources: drop entirely
+        if rank == 0:
             log.info("blocked source dropped: %s | %s", item.get("source"), (item.get("title") or "")[:70])
             db.mark_seen(item, lane="slow", posted=False)
             continue
-        if is_clickbait(item.get("title")):
-            log.info("clickbait dropped: %s", (item.get("title") or "")[:70])
-            db.mark_seen(item, lane="slow", posted=False)
-            continue
 
-        item["category"] = guess_category(item)
-        out.append(item)
+        if rank >= 8:
+            # VIP lane: only exact URL dupe check (already done above)
+            item["category"] = guess_category(item)
+            vip_items.append(item)
+        else:
+            # Standard lane: clickbait filter first
+            if is_clickbait(item.get("title")):
+                log.info("clickbait dropped: %s", (item.get("title") or "")[:70])
+                db.mark_seen(item, lane="slow", posted=False)
+                continue
+            if is_blocked_source(item.get("source"), item.get("url")):
+                log.info("blocked source dropped: %s | %s", item.get("source"), (item.get("title") or "")[:70])
+                db.mark_seen(item, lane="slow", posted=False)
+                continue
+            item["category"] = guess_category(item)
+            std_items.append(item)
 
-    log.info("prefilter: %d in -> %d out", len(items), len(out))
-    return out
+    # Authority dedup on standard lane: MinHash + keep higher rank
+    unique_std: list[dict[str, Any]] = []
+    for item in std_items:
+        tn = item["title_norm"]
+        event_id = db.url_hash(item["url"])[:32]
+        if not is_duplicate_fast(tn or item["title"], event_id):
+            unique_std.append(item)
+        else:
+            # Find the existing dupe and keep the higher-rank one
+            for idx, existing in enumerate(unique_std):
+                existing_id = db.url_hash(existing["url"])[:32]
+                # Quick title similarity check (MinHash already matched)
+                if existing["title"][:30].lower() in item["title"].lower() or \
+                   item["title"][:30].lower() in existing["title"].lower():
+                    if item.get("source_rank", 5) > existing.get("source_rank", 5):
+                        unique_std[idx] = item  # swap in the higher-rank source
+                    break
+            log.debug("Standard-lane near-dupe handled: %s", item["title"][:70])
+
+    # Sort: VIP newest-first; Standard rank-desc then newest
+    vip_items.sort(key=lambda i: i.get("published_at") or "", reverse=True)
+    unique_std.sort(key=lambda i: (-i.get("source_rank", 5), i.get("published_at") or ""), reverse=False)
+    # fix: negative rank sort means we need descending rank, so -rank ascending
+
+    # Correct sort: high rank first, then newest
+    unique_std.sort(key=lambda i: (i.get("source_rank", 5), i.get("published_at") or ""), reverse=True)
+
+    vip_take = min(len(vip_items), 50)
+    std_take = min(len(unique_std), max_total - vip_take)
+
+    vip_out = vip_items[:vip_take]
+    std_out = unique_std[:std_take]
+
+    vip_out.sort(key=lambda i: i.get("published_at") or "", reverse=True)
+
+    log.info(
+        "prefilter_and_cap: %d in → vip:%d(%d) + std:%d(%d) = %d total (cap %d)",
+        len(items), len(vip_items), len(vip_out),
+        len(std_items), len(std_out),
+        len(vip_out) + len(std_out), max_total,
+    )
+    return vip_out + std_out
+
+
+# Legacy wrapper — called by slow_lane.run_cycle so it compiles without a change there.
+# (slow_lane.py is updated to call prefilter_and_cap directly now.)
+def prefilter(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return prefilter_and_cap(items, max_total=150)
 
 
 # ------------------------------------------------------------------ router
@@ -217,12 +358,10 @@ def resolve_channel(category: str | None) -> str:
 
 
 def esc(text: str | None) -> str:
-    """Escape for Telegram HTML parse mode."""
     return html.escape(str(text or ""), quote=False)
 
 
 def short_url(url: str, limit: int = 34) -> str:
-    """Human-readable short form of a URL, for when we show it as text."""
     if not url:
         return ""
     try:
@@ -240,12 +379,9 @@ def short_url(url: str, limit: int = 34) -> str:
 
 
 def link(url: str, text: str) -> str:
-    """An HTML anchor — keeps the raw URL out of the visible message."""
     return f'<a href="{html.escape(url, quote=True)}">{esc(text)}</a>'
 
 
-# Pretty publisher names for our internal fetcher ids, so posts read
-# "BBC Middle East" rather than "bbc_mideast".
 SOURCE_LABELS = {
     "bbc_mideast": "BBC Middle East",
     "bbc_world": "BBC World",
@@ -276,13 +412,11 @@ SOURCE_LABELS = {
 
 
 def pretty_source(name: str | None) -> str:
-    """Map an internal fetcher id to a human publisher name."""
     if not name:
         return ""
     key = str(name).strip()
     if key in SOURCE_LABELS:
         return SOURCE_LABELS[key]
-    # Unknown Google-News-backed fetchers: strip our prefix and tidy up.
     cleaned = re.sub(r"^gnews_", "", key).replace("_", " ").strip()
     return cleaned.title() if cleaned.islower() else cleaned or key
 
@@ -291,149 +425,67 @@ def _norm_name(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().casefold()
 
 
-# Editorial reliability score per publisher, 1-10. Hardcoded on purpose: asking
-# the LLM would make the same outlet score differently on every post.
-# Names are matched case-insensitively via pretty_source + aliases.
 SOURCE_RELIABILITY = {
-    # Wire / official
-    "Reuters": 9,
-    "Associated Press": 9,
-    "AP": 9,
-    "AFP": 9,
-    "BBC World": 9,
-    "BBC Middle East": 9,
-    "BBC": 9,
-    "SEC EDGAR": 10,
-    "NSE": 9,
-    "BSE": 9,
-    # Global majors (user: Bloomberg = 10)
-    "Bloomberg": 10,
-    "Bloomberg News": 10,
-    "The Wall Street Journal": 9,
-    "Wall Street Journal": 9,
-    "WSJ": 9,
-    "Financial Times": 9,
-    "FT": 9,
-    # Major newsrooms (India + global)
-    "Times of India": 8,
-    "The Times of India": 8,
-    "TOI": 8,
+    "Reuters": 9, "Associated Press": 9, "AP": 9, "AFP": 9,
+    "BBC World": 9, "BBC Middle East": 9, "BBC": 9,
+    "SEC EDGAR": 10, "NSE": 9, "BSE": 9,
+    "Bloomberg": 10, "Bloomberg News": 10,
+    "The Wall Street Journal": 9, "Wall Street Journal": 9, "WSJ": 9,
+    "Financial Times": 9, "FT": 9,
+    "Times of India": 8, "The Times of India": 8, "TOI": 8,
     "NDTV": 8,
-    "Economic Times": 8,
-    "The Economic Times": 8,
-    "Livemint": 8,
-    "Mint": 8,
+    "Economic Times": 8, "The Economic Times": 8,
+    "Livemint": 8, "Mint": 8,
     "Business Standard": 8,
-    "The Hindu BusinessLine": 8,
-    "The Hindu": 8,
+    "The Hindu BusinessLine": 8, "The Hindu": 8,
     "Al Jazeera": 8,
-    "CNBC": 8,
-    "CNBC TV18": 8,
-    "CNBCTV18": 8,
+    "CNBC": 8, "CNBC TV18": 8, "CNBCTV18": 8,
     "NDTV Profit": 8,
-    "Forbes": 8,
-    "Forbes India": 8,
-    "The Diplomat": 8,
-    "DW": 8,
-    "France 24": 8,
-    "NPR": 8,
-    "Hindustan Times": 8,
-    "The Hindustan Times": 8,
-    "Indian Express": 8,
-    "The Indian Express": 8,
-    "Barron's": 8,
-    "Barrons": 8,
-    "New York Times": 8,
-    "The New York Times": 8,
-    "NYT": 8,
-    "Washington Post": 8,
-    "The Washington Post": 8,
-    "The Telegraph": 8,
-    "The Guardian": 8,
-    "Guardian": 8,
-    # Solid trade
-    "MarketWatch": 7,
-    "The Hill": 7,
-    "CoinDesk": 7,
-    "Cointelegraph": 7,
-    "Decrypt": 7,
-    "Investing.com": 7,
-    "Investing.com India": 7,
-    "Yahoo Finance": 6,
-    "TheStreet": 6,
-    "The Street": 6,
+    "Forbes": 8, "Forbes India": 8,
+    "The Diplomat": 8, "DW": 8, "France 24": 8, "NPR": 8,
+    "Hindustan Times": 8, "The Hindustan Times": 8,
+    "Indian Express": 8, "The Indian Express": 8,
+    "Barron's": 8, "Barrons": 8,
+    "New York Times": 8, "The New York Times": 8, "NYT": 8,
+    "Washington Post": 8, "The Washington Post": 8,
+    "The Telegraph": 8, "The Guardian": 8, "Guardian": 8,
+    "MarketWatch": 7, "The Hill": 7,
+    "CoinDesk": 7, "Cointelegraph": 7, "Decrypt": 7,
+    "Investing.com": 7, "Investing.com India": 7,
+    "Yahoo Finance": 6, "TheStreet": 6, "The Street": 6,
 }
-DEFAULT_RELIABILITY = 5  # unknown / Google News aggregate — below named newsrooms
+DEFAULT_RELIABILITY = 5
 
-# Domain → score. Used when the source string is a host or the URL is present.
 DOMAIN_RELIABILITY = {
-    "reuters.com": 9,
-    "bbc.co.uk": 9,
-    "bbc.com": 9,
-    "apnews.com": 9,
-    "afp.com": 9,
-    "sec.gov": 10,
-    "bloomberg.com": 10,
-    "wsj.com": 9,
-    "ft.com": 9,
-    "nseindia.com": 9,
-    "bseindia.com": 9,
-    "timesofindia.indiatimes.com": 8,
-    "toi.in": 8,
-    "ndtv.com": 8,
-    "economictimes.indiatimes.com": 8,
-    "livemint.com": 8,
-    "business-standard.com": 8,
-    "thehindubusinessline.com": 8,
-    "thehindu.com": 8,
-    "aljazeera.com": 8,
-    "cnbc.com": 8,
-    "cnbctv18.com": 8,
-    "ndtvprofit.com": 8,
-    "forbes.com": 8,
-    "forbesindia.com": 8,
-    "thediplomat.com": 8,
-    "dw.com": 8,
-    "france24.com": 8,
-    "npr.org": 8,
-    "hindustantimes.com": 8,
-    "indianexpress.com": 8,
-    "barrons.com": 8,
-    "nytimes.com": 8,
-    "washingtonpost.com": 8,
-    "telegraph.co.uk": 8,
-    "theguardian.com": 8,
-    "marketwatch.com": 7,
-    "thehill.com": 7,
-    "coindesk.com": 7,
-    "cointelegraph.com": 7,
-    "decrypt.co": 7,
-    "investing.com": 7,
-    "finance.yahoo.com": 6,
-    "yahoo.com": 6,
+    "reuters.com": 9, "bbc.co.uk": 9, "bbc.com": 9,
+    "apnews.com": 9, "afp.com": 9, "sec.gov": 10,
+    "bloomberg.com": 10, "wsj.com": 9, "ft.com": 9,
+    "nseindia.com": 9, "bseindia.com": 9,
+    "timesofindia.indiatimes.com": 8, "toi.in": 8,
+    "ndtv.com": 8, "economictimes.indiatimes.com": 8,
+    "livemint.com": 8, "business-standard.com": 8,
+    "thehindubusinessline.com": 8, "thehindu.com": 8,
+    "aljazeera.com": 8, "cnbc.com": 8, "cnbctv18.com": 8,
+    "ndtvprofit.com": 8, "forbes.com": 8, "forbesindia.com": 8,
+    "thediplomat.com": 8, "dw.com": 8, "france24.com": 8,
+    "npr.org": 8, "hindustantimes.com": 8, "indianexpress.com": 8,
+    "barrons.com": 8, "nytimes.com": 8, "washingtonpost.com": 8,
+    "telegraph.co.uk": 8, "theguardian.com": 8,
+    "marketwatch.com": 7, "thehill.com": 7,
+    "coindesk.com": 7, "cointelegraph.com": 7, "decrypt.co": 7,
+    "investing.com": 7, "finance.yahoo.com": 6, "yahoo.com": 6,
     "thestreet.com": 6,
 }
 
-# Stock-picker / SEO blogs — never auto-post.
 BLOCKED_DOMAINS = {
-    "fool.com",
-    "insidermonkey.com",
-    "247wallst.com",
-    "247wallstreet.com",
-    "barchart.com",
-    "benzinga.com",
+    "fool.com", "insidermonkey.com", "247wallst.com",
+    "247wallstreet.com", "barchart.com", "benzinga.com",
     "seekingalpha.com",
 }
 BLOCKED_NAMES = {
-    "motley fool",
-    "the motley fool",
-    "insider monkey",
-    "24/7 wall st.",
-    "24/7 wall st",
-    "247 wall st",
-    "barchart",
-    "benzinga",
-    "seeking alpha",
+    "motley fool", "the motley fool", "insider monkey",
+    "24/7 wall st.", "24/7 wall st", "247 wall st",
+    "barchart", "benzinga", "seeking alpha",
 }
 
 _CLICKBAIT = [
@@ -445,17 +497,22 @@ _CLICKBAIT = [
     re.compile(r"\b(top|best)\s+\d+\s+(stocks|gains|losers)\b", re.I),
 ]
 
-# NSE/BSE routine filings — reject without spending an LLM call.
+# Fast-lane auto-reject patterns — only literal garbage now.
+# director_change, analyst_meet, record_date moved to NEEDS_LLM_JUDGMENT.
 _FAST_REJECT = [
     re.compile(r"copy of newspaper publication", re.I),
     re.compile(r"newspaper publication", re.I),
-    re.compile(r"change in director", re.I),
-    re.compile(r"shareholders['’]? meeting", re.I),
-    re.compile(r"analysts?/institutional investor meet", re.I),
-    re.compile(r"con\.?\s*call updates", re.I),
     re.compile(r"compliance[- ]certificate", re.I),
+    re.compile(r"shareholders['’]? meeting", re.I),
+    re.compile(r"con\.?\s*call updates", re.I),
     re.compile(r"outcome of (the )?agm", re.I),
     re.compile(r"updates on annual general meeting", re.I),
+]
+
+# These were blind-rejected before; now they go to the LLM with STRICT_MODE.
+NEEDS_LLM_JUDGMENT = [
+    re.compile(r"change in director", re.I),
+    re.compile(r"analysts?/institutional investor meet", re.I),
     re.compile(r"\brecord date\b", re.I),
 ]
 
@@ -507,18 +564,11 @@ def is_clickbait(title: str | None) -> bool:
     return any(p.search(t) for p in _CLICKBAIT)
 
 
-_TLD_SUFFIX = re.compile(
-    r"\.(com|net|org|io|co\.uk|com\.au|co\.in|in)$",
-    re.I,
-)
+_TLD_SUFFIX = re.compile(r"\.(com|net|org|io|co\.uk|com\.au|co\.in|in)$", re.I)
 _GOOGLE_HOSTS = {"news.google.com", "google.com", "news.google.co.in"}
 
 
 def _brand_score(source: str | None) -> int | None:
-    """Exact, then longest brand prefix: 'NDTV Profit' → NDTV, 'CNBC TV18' → CNBC.
-
-    Also 'Bloomberg.com' → Bloomberg (Google News labels often include the TLD).
-    """
     cands = {_norm_name(pretty_source(source)), _norm_name(source or "")}
     extra = set()
     for cand in cands:
@@ -547,7 +597,6 @@ def source_reliability(source: str | None, url: str | None = None) -> int:
     if hit is not None:
         return hit
     host = _host_from(source, url)
-    # Google News RSS: URL host is google, publisher is in the source string.
     if host in _GOOGLE_HOSTS:
         host = _host_from(source, None)
     dom = _domain_score(host)
@@ -557,12 +606,18 @@ def source_reliability(source: str | None, url: str | None = None) -> int:
 
 
 def rule_fast_decision(item: dict[str, Any]) -> str | None:
-    """Return 'reject' for routine market filings; None = ask the LLM."""
+    """Return 'reject' for routine market filings; 'needs_llm' for moved-to-LLM types; None = ask LLM."""
     title = item.get("title") or ""
     et = (item.get("event_type") or "").lower()
+
+    # Pure garbage — still auto-reject
     if any(p.search(title) for p in _FAST_REJECT):
         return "reject"
-    # Random US registration statements are not a priced IPO.
+
+    # Previously blind-rejected — now flagged for LLM STRICT_MODE
+    if any(p.search(title) for p in NEEDS_LLM_JUDGMENT):
+        return "needs_llm"
+
     if et == "ipo" and _SEC_BOILER.search(title):
         return "reject"
     if _SEC_BOILER.match(title) and et == "earnings":
@@ -586,11 +641,6 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def format_published(iso: str | None) -> str:
-    """'22 Aug 2026, 17:39 IST · 6h ago', or 'recent' if we have no real time.
-
-    Never fabricates a timestamp: an empty published_at renders as "recent"
-    rather than pretending the fetch time is the publish time.
-    """
     if not iso:
         return "recent"
     try:
@@ -599,14 +649,12 @@ def format_published(iso: str | None) -> str:
         return "recent"
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-
     local = dt.astimezone(IST)
     stamp = local.strftime("%d %b %Y, %H:%M IST")
-
     delta = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
     secs = int(delta.total_seconds())
     if secs < 0:
-        return stamp  # clock skew / future-dated feed: show the time only
+        return stamp
     if secs < 3600:
         ago = f"{max(secs // 60, 1)}m ago"
     elif secs < 86400:
@@ -616,8 +664,6 @@ def format_published(iso: str | None) -> str:
     return f"{stamp} · {ago}"
 
 
-# Channels that keep the short format — high-volume feeds where full cards
-# would read as a wall of text. Override via COMPACT_CATEGORIES in .env.
 COMPACT_CATEGORIES = {
     c.strip() for c in (config._env("COMPACT_CATEGORIES", "daily_news") or "").split(",") if c.strip()
 }
@@ -628,7 +674,6 @@ def significance_dot(score: int) -> str:
 
 
 def render_explain(raw: str | None) -> str:
-    """Render the LLM explainer as escaped HTML lines with a leading bullet."""
     if not raw:
         return ""
     lines = [l.strip() for l in str(raw).split("\n") if l.strip()]
@@ -636,14 +681,6 @@ def render_explain(raw: str | None) -> str:
 
 
 def build_message(item: dict[str, Any]) -> str:
-    """Full news card: significance, source, time, what happened, why it matters.
-
-    Constraint 4 still holds — the body is the LLM's own summary/analysis, never
-    the publisher's sentences, and only a link back to the original.
-
-    Daily News stays compact (COMPACT_CATEGORIES): that channel carries ~90
-    items a cycle and full cards there read as a wall of text.
-    """
     cat = item.get("category", "general")
     label = CATEGORY_LABELS.get(cat, "📰 News")
     src = pretty_source(item.get("source"))
@@ -669,7 +706,6 @@ def build_message(item: dict[str, Any]) -> str:
     lines = [f"{significance_dot(sig)} <b>Significance: {sig}/10</b> · {esc(label)}", ""]
     lines.append(f"<b>{link(url, title)}</b>" if url else f"<b>{esc(title)}</b>")
     lines.append("")
-
     meta = f"📰 <b>{esc(src or 'Unknown')}</b> · ⭐️ Reliability {rel}/10"
     lines.append(meta)
     lines.append(f"📅 {esc(format_published(item.get('published_at')))}")
@@ -696,7 +732,6 @@ def build_message(item: dict[str, Any]) -> str:
 
 
 def build_market_message(item: dict[str, Any], verdict: dict[str, Any]) -> str:
-    """Same card shape for fast-lane market alerts."""
     cat = verdict.get("category", "general")
     label = CATEGORY_LABELS.get(cat, "📊 Market")
     src = pretty_source(item.get("source"))

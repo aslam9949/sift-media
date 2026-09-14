@@ -97,6 +97,10 @@ def connect() -> sqlite3.Connection:
         config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         _conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
+        # Concurrency: WAL mode allows concurrent readers + one writer without
+        # "database is locked" errors when the fast lane and slow lane overlap.
+        _conn.execute("PRAGMA journal_mode=WAL;")
+        _conn.execute("PRAGMA synchronous=NORMAL;")
         _conn.executescript(SCHEMA)
         _migrate(_conn)
         _conn.commit()

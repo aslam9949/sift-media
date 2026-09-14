@@ -69,7 +69,9 @@ def route_channel(category: str | None) -> str:
 LLM_API_KEY = _env("BAI_API_KEY") or _env("OPENROUTER_API_KEY")
 LLM_BASE_URL = _env("BAI_BASE_URL", "https://api.b.ai/v1")
 LLM_MODEL = _env("BAI_MODEL", "deepseek-v4-flash-vision-exp")
-LLM_ENABLED = bool(LLM_API_KEY)
+LLM_ENABLED = bool(LLM_API_KEY) or bool(_env("OPENROUTER_API_KEY"))
+OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
+OPENROUTER_API_BASE = _env("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
 LLM_TIMEOUT = _int("LLM_TIMEOUT", 120)
 # Reasoning model: it burns completion tokens on an internal reasoning channel
 # before emitting JSON. Budget generously or the answer gets truncated to empty.

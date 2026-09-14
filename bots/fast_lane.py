@@ -6,12 +6,14 @@ scheduler → fetcher → PER-ITEM 3-way smart filter → router → send queue
   reject → dropped silently (still recorded, so we don't re-judge it)
 
 Runs on BOT2_TOKEN when present; falls back to BOT1_TOKEN in single-bot mode.
+
+director_change, analyst_meet, and record_date are no longer blind-rejected.
+They go through the LLM in STRICT_MODE — only genuinely market-moving events survive.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import config
@@ -23,7 +25,6 @@ from send_queue import get_queue
 
 log = logging.getLogger("fast_lane")
 
-# Highest-signal event types first — if we hit the per-cycle cap, these win.
 PRIORITY = {
     "bulk_deal": 0, "block_deal": 0, "ipo": 1, "earnings": 2,
     "corp_action": 3, "fii_dii": 3, "short_selling": 4,
@@ -112,9 +113,6 @@ async def run_cycle() -> dict[str, int]:
         log.info("deal collapse drop %s | %s", item.get("company"), (item.get("title") or "")[:70])
 
     fresh.sort(key=lambda i: PRIORITY.get(i.get("event_type") or "", 9))
-    # Cap harder than the slow lane: each item is its own LLM call, and b.ai
-    # rate-limits, so a 3-minute cycle can only realistically judge a handful.
-    # Highest-priority event types survive the cut (sorted above).
     fresh = fresh[: config.FAST_MAX_ITEMS_PER_CYCLE]
     stats["new"] = len(fresh)
 
@@ -122,11 +120,14 @@ async def run_cycle() -> dict[str, int]:
     queue.start()
     admin_chat = config.route_channel("admin_health")
 
-    # Gate 2: routine NSE/BSE filings die here — no LLM spend.
+    # Gate 2: rule-based routing.
+    # needs_llm items (director_change, analyst_meet, record_date) now pass
+    # through to the LLM instead of being blind-rejected.
     need_llm: list[dict[str, Any]] = []
     ruled: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for item in fresh:
-        if pipeline.rule_fast_decision(item) == "reject":
+        ruling = pipeline.rule_fast_decision(item)
+        if ruling == "reject":
             ruled.append((item, {
                 "decision": "reject",
                 "category": item.get("category", "general"),
@@ -134,17 +135,17 @@ async def run_cycle() -> dict[str, int]:
                 "significance": 1,
                 "reason": "rule: routine filing",
             }))
+        elif ruling == "needs_llm":
+            # Pass through to LLM — STRICT_MODE flag is appended inside filter_item
+            need_llm.append(item)
         else:
             need_llm.append(item)
 
+    # Per-item LLM filtering — now async via OpenRouter
     verdicts: list[dict[str, Any]] = []
     if need_llm:
-        workers = max(1, min(config.FAST_FILTER_WORKERS, len(need_llm)))
-        loop = asyncio.get_running_loop()
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            verdicts = await asyncio.gather(
-                *(loop.run_in_executor(pool, smart_filter.filter_item, item) for item in need_llm)
-            )
+        coros = [smart_filter.filter_item(item) for item in need_llm]
+        verdicts = await asyncio.gather(*coros)
 
     judged = list(zip(need_llm, verdicts)) + ruled
 
@@ -153,7 +154,6 @@ async def run_cycle() -> dict[str, int]:
         cat = verdict.get("category") or item.get("category") or "general"
         item["category"] = cat
 
-        # Persist the verdict first — prevents a re-judge (and re-spend) on crash.
         db.save_market_event(
             {**item, "event_key": item["event_key"]},
             decision=decision,
