@@ -1,0 +1,20 @@
+[Unit]
+Description=Aslam News Media — Telegram news & markets aggregation bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/aslam-news-media
+EnvironmentFile=/root/aslam-news-media/.env
+ExecStart=/root/aslam-news-media/.venv/bin/python /root/aslam-news-media/main.py run
+Restart=always
+RestartSec=15
+StandardOutput=append:/root/aslam-news-media/data/bot.log
+StandardError=append:/root/aslam-news-media/data/bot.log
+# Let a long fetch/LLM cycle finish before a restart kills it
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

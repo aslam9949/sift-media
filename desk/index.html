@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<title>Sift Media — Live</title>
+<link rel="stylesheet" href="/style.css?v=bb2">
+</head>
+<body>
+<div class="bb-bar">
+  <div class="logo">
+    <span class="mark">S</span>
+    <div class="word">
+      <b>SIFT</b>
+      <span>MEDIA</span>
+    </div>
+  </div>
+  <div class="bb-live"><i class="pulse"></i> LIVE</div>
+  <div class="bb-clock" id="clock"></div>
+</div>
+
+<div class="ticker" aria-hidden="true">
+  <div class="ticker-track" id="ticker"></div>
+</div>
+
+<nav class="nav" id="nav"></nav>
+
+<div class="sub">
+  <div class="next" id="nextprint"></div>
+  <div class="tabs">
+    <button type="button" class="tab on" data-tab="wire">LATEST</button>
+    <button type="button" class="tab" data-tab="digest">ANALYSIS</button>
+  </div>
+</div>
+
+<main id="front">
+  <section class="hero">
+    <article class="lead" id="lead"></article>
+    <aside class="rail" id="rail"></aside>
+  </section>
+  <section class="cols" id="cols"></section>
+  <section class="bottom">
+    <div>
+      <h2 class="sec">THE TAPE</h2>
+      <div id="wire"></div>
+    </div>
+    <aside>
+      <h2 class="sec">PRINTS AHEAD</h2>
+      <div id="cal"></div>
+      <h2 class="sec">MARKETS</h2>
+      <div id="tape"></div>
+    </aside>
+  </section>
+</main>
+
+<main id="section" hidden>
+  <div id="seclist"></div>
+</main>
+
+<footer class="foot" id="foot"></footer>
+<script src="/app.js?v=bb2"></script>
+</body>
+</html>

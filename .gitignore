@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.log
+*.log.*
+grabbed_ids.txt
+.DS_Store
